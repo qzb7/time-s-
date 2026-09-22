@@ -214,6 +214,17 @@ class PatchedCausalStdScaler(nn.Module):
         increment = delta * (data_shifted - causal_loc_shifted) * mask
         m_2 = torch.cumsum(increment, dim=-1)
         causal_var = m_2 / (denominator - self.correction).clamp(min=1)
+        if os.environ.get("TOTO2_DEBUG_NAN", "0") == "1":
+            for _n, _t in [("data", data), ("ref", ref), ("shifted", data_shifted),
+                           ("loc_shifted", causal_loc_shifted), ("delta", delta),
+                           ("increment", increment), ("m2", m_2), ("var", causal_var)]:
+                _bad = int(torch.isnan(_t).sum().item()) + int(torch.isinf(_t).sum().item())
+                _amax = float(_t.abs().max().item()) if _t.numel() else 0.0
+                print(f"[TOTO2-MAG] scaler.{_n}: nan+inf={_bad}/{_t.numel()} abs_max={_amax:.6g}", flush=True)
+        # 防溢出兜底：float32 下若数据含大离群值，increment=delta² 会溢出成 inf，
+        # 使 causal_var=inf、scale=sqrt(inf)=inf。把非有限方差钳到有限范围，避免训练崩溃
+        # （离群值序列的 scale 会被钳到有限大值，误差仅限这些异常序列）。
+        causal_var = torch.nan_to_num(causal_var, nan=0.0, posinf=3.0e30, neginf=0.0)
         # Welford 的 M2 理论上非负，但 float32 长序列累积的舍入误差仍可能使其成为微小负值；
         # 直接 sqrt(负数) 会得 NaN，且后续 clamp(min=minimum_scale) 无法修复 NaN。
         causal_var = causal_var.clamp(min=0.0)
