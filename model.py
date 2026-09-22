@@ -192,46 +192,46 @@ class PatchedCausalStdScaler(nn.Module):
         return torch.where(mask, ratio, 0), loc, scale
 
     def _compute_loc_scale(self, data: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # 数值稳定：NPU 不支持 float64，scaler 被迫走 float32。原始 Welford 在线方差在
-        # float32 下对「大均值、小方差、长序列」数据会发生灾难性消减——data - prev_loc
-        # 是两个量级相近的大数相减（数据均值可达 ~1e6，float32 的 ULP≈0.06），真实波动
-        # 被抹平甚至让 m_2 累积出负值/NaN，最终 (data - loc)/scale 出现非有限值。
-        # 解法：先把每个序列平移到 0 附近（减去全局有效均值 ref）。标准差对平移不变，
-        # 所以 scale 不受影响；loc 最后加回 ref。平移后数据量级从 ~1e6 降到 ~std，
-        # 消除了大数相减的精度丢失。
+        # 数值稳定：NPU 上 scaler 实际以 float32 执行（double 算子被 CANN 降级）。数据里
+        # 存在 ~1e20 的离群值，若直接算 Welford 方差，delta² 会溢出 float32(3.4e38) 成 inf。
+        # 这里用「平移 + 缩放」两步预处理，二者在还原时都精确抵消，不改变 scale/loc 的
+        # 因果语义，也不泄露未来信息：
+        #   平移(ref)：std 平移不变，消减大数相减的灾难性消减；
+        #   缩放(scale_factor)：std 缩放线性(除以再乘回精确抵消)，把数据压到 [-1,1] 防溢出。
         valid_count = mask.sum(dim=-1, keepdim=True).clamp_min(1)
         ref = (data * mask).sum(dim=-1, keepdim=True) / valid_count
         data_shifted = (data - ref) * mask
 
-        # Causal (cumulative) mean on the shifted data
-        cum_shifted = data_shifted.cumsum(dim=-1)
-        denominator = mask.cumsum(dim=-1).clamp_min(1)
-        causal_loc_shifted = cum_shifted / denominator
+        scale_factor = data_shifted.abs().max(dim=-1, keepdim=True).values.clamp_min(1e-6)
+        data_scaled = data_shifted / scale_factor
 
-        # Welford-style causal variance on the shifted data
-        prev_loc = torch.cat([torch.zeros_like(causal_loc_shifted[..., :1]), causal_loc_shifted[..., :-1]], dim=-1)
-        delta = data_shifted - prev_loc
-        increment = delta * (data_shifted - causal_loc_shifted) * mask
+        # Causal (cumulative) mean on the scaled data
+        cum_scaled = data_scaled.cumsum(dim=-1)
+        denominator = mask.cumsum(dim=-1).clamp_min(1)
+        causal_loc_scaled = cum_scaled / denominator
+
+        # Welford-style causal variance on the scaled data（量级 ∈ [-1,1]，float32 稳定）
+        prev_loc = torch.cat([torch.zeros_like(causal_loc_scaled[..., :1]), causal_loc_scaled[..., :-1]], dim=-1)
+        delta = data_scaled - prev_loc
+        increment = delta * (data_scaled - causal_loc_scaled) * mask
         m_2 = torch.cumsum(increment, dim=-1)
         causal_var = m_2 / (denominator - self.correction).clamp(min=1)
         if os.environ.get("TOTO2_DEBUG_NAN", "0") == "1":
-            for _n, _t in [("data", data), ("ref", ref), ("shifted", data_shifted),
-                           ("loc_shifted", causal_loc_shifted), ("delta", delta),
+            print(f"[TOTO2-MAG] scaler.data.dtype={data.dtype}", flush=True)
+            for _n, _t in [("data", data), ("ref", ref), ("scale_factor", scale_factor),
+                           ("data_scaled", data_scaled), ("delta", delta),
                            ("increment", increment), ("m2", m_2), ("var", causal_var)]:
                 _bad = int(torch.isnan(_t).sum().item()) + int(torch.isinf(_t).sum().item())
                 _amax = float(_t.abs().max().item()) if _t.numel() else 0.0
                 print(f"[TOTO2-MAG] scaler.{_n}: nan+inf={_bad}/{_t.numel()} abs_max={_amax:.6g}", flush=True)
-        # 防溢出兜底：float32 下若数据含大离群值，increment=delta² 会溢出成 inf，
-        # 使 causal_var=inf、scale=sqrt(inf)=inf。把非有限方差钳到有限范围，避免训练崩溃
-        # （离群值序列的 scale 会被钳到有限大值，误差仅限这些异常序列）。
-        causal_var = torch.nan_to_num(causal_var, nan=0.0, posinf=3.0e30, neginf=0.0)
         # Welford 的 M2 理论上非负，但 float32 长序列累积的舍入误差仍可能使其成为微小负值；
         # 直接 sqrt(负数) 会得 NaN，且后续 clamp(min=minimum_scale) 无法修复 NaN。
         causal_var = causal_var.clamp(min=0.0)
-        causal_scale = torch.sqrt(causal_var).clamp(min=self.minimum_scale)
+        causal_std = torch.sqrt(causal_var).clamp(min=self.minimum_scale)
 
-        # 还原 loc 到原坐标系（scale 对平移不变，无需还原）
-        causal_loc = causal_loc_shifted + ref
+        # 还原到原坐标系：scale 乘回缩放因子，loc 乘回缩放因子再加回平移。
+        causal_scale = (causal_std * scale_factor).clamp(min=self.minimum_scale)
+        causal_loc = causal_loc_scaled * scale_factor + ref
 
         # Patch-aware: use last value in each patch, repeat across patch
         loc = repeat(
