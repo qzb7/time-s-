@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -143,31 +142,55 @@ def _iter_target_channels(target) -> list[np.ndarray]:
     return []
 
 
-def _read_pretrain_arrow_targets(arrow_path: Path):
-    """Yield per-row channel arrays from a prepared-arrow file using pyarrow."""
-    import pyarrow as pa
+def _peek_file(path: Path, n: int = 16) -> str:
+    try:
+        raw = path.read_bytes()[:n]
+    except Exception as exc:  # noqa: BLE001
+        return f"<unreadable: {exc}>"
+    text = "".join(chr(b) if 32 <= b < 127 else "." for b in raw)
+    return f"{raw.hex(' ')}  [{text}]"
 
-    with pa.memory_map(str(arrow_path), "r") as source:
-        table = pa.ipc.open_file(source).read_all()
-    names = set(table.column_names)
-    if "target" not in names:
-        print(f"      [skip] {arrow_path.name}: no 'target' column (has {sorted(names)})")
+
+def _read_pretrain_arrow_targets(arrow_path: Path):
+    """Yield per-row channel arrays from a prepared-arrow file.
+
+    The loader (`GIFTEvalDynamicStreamingDataset._get_arrow_dataset`) reads these
+    files with `datasets.Dataset.from_file` as its *primary* path; raw pyarrow
+    (`pa.ipc.open_file`) is only its fallback.  Some pretrain `.arrow` files are
+    not plain Arrow IPC streams, so we mirror that ordering here and, on failure,
+    sniff the leading bytes to identify the real format.
+    """
+    from datasets import Dataset as HFDataset
+
+    try:
+        ds = HFDataset.from_file(str(arrow_path), in_memory=False)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"not readable as HF arrow (head={_peek_file(arrow_path)}): {exc}"
+        ) from exc
+
+    try:
+        target_col = ds["target"]
+    except KeyError:
+        print(f"      [skip] {arrow_path.name}: no 'target' column")
         return
-    target_col = table["target"]
-    for row in target_col.to_pylist():
+    for row in target_col:
         yield from _iter_target_channels(row)
 
 
 def check_pretrain(data_dir: Path, *, abs_warn: float, abs_error: float,
                    max_files_per_dataset: int, max_series_per_dataset: int):
+    print(f"\n=== pretrain ({data_dir}) ===", flush=True)
     if not data_dir.is_dir():
-        print(f"[pretrain] data_dir not found: {data_dir}")
+        print(f"  data_dir not found: {data_dir}", flush=True)
         return
 
-    acc = defaultdict(_Accumulator)
-    for ds_dir in sorted(data_dir.iterdir()):
-        if not ds_dir.is_dir() or ds_dir.name.startswith("."):
-            continue
+    ds_dirs = sorted(
+        p for p in data_dir.iterdir()
+        if p.is_dir() and not p.name.startswith(".")
+    )
+    print(f"dataset dirs found: {len(ds_dirs)}", flush=True)
+    for ds_dir in ds_dirs:
         files = sorted(
             p for p in ds_dir.iterdir()
             if p.name.startswith("data-") and p.name.endswith(".arrow")
@@ -177,23 +200,21 @@ def check_pretrain(data_dir: Path, *, abs_warn: float, abs_error: float,
         if max_files_per_dataset:
             files = files[:max_files_per_dataset]
 
-        ds_acc = acc[ds_dir.name]
+        acc = _Accumulator()
         for fp in files:
             try:
                 channels = _read_pretrain_arrow_targets(fp)
             except Exception as exc:  # noqa: BLE001 - report and continue
-                print(f"  !! failed to read {fp}: {exc}")
+                print(f"    !! failed to read {fp.name}: {exc}", flush=True)
                 continue
             for ch in channels:
-                if max_series_per_dataset and ds_acc.n_series >= max_series_per_dataset:
+                if max_series_per_dataset and acc.n_series >= max_series_per_dataset:
                     break
-                ds_acc.add(_series_stats(ch), abs_warn=abs_warn, abs_error=abs_error)
-
-    print(f"\n=== pretrain ({data_dir}) ===")
-    print(f"datasets scanned: {len(acc)}")
-    for name in sorted(acc):
-        print(f"  [{name}]")
-        print(acc[name].summary(abs_warn=abs_warn, abs_error=abs_error))
+                acc.add(_series_stats(ch), abs_warn=abs_warn, abs_error=abs_error)
+            if max_series_per_dataset and acc.n_series >= max_series_per_dataset:
+                break
+        print(f"  [{ds_dir.name}] files={len(files)}", flush=True)
+        print(acc.summary(abs_warn=abs_warn, abs_error=abs_error), flush=True)
 
 
 def check_gifteval(gift_eval_path: Path, gift_eval_src: str | None, *,
