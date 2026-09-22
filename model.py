@@ -182,25 +182,45 @@ class PatchedCausalStdScaler(nn.Module):
 
         loc, scale = self._compute_loc_scale(hp, mask)
         loc, scale = loc.to(data.dtype), scale.to(data.dtype)
-        return torch.where(mask, (data - loc) / scale, 0), loc, scale
+        _debug_forward_nan("scaler.data", data)
+        _debug_forward_nan("scaler.loc", loc)
+        _debug_forward_nan("scaler.scale", scale)
+        diff = data - loc
+        _debug_forward_nan("scaler.data_minus_loc", diff)
+        ratio = diff / scale
+        _debug_forward_nan("scaler.ratio", ratio)
+        return torch.where(mask, ratio, 0), loc, scale
 
     def _compute_loc_scale(self, data: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Causal (cumulative) mean
-        cum_data = (data * mask).cumsum(dim=-1)
-        denominator = mask.cumsum(dim=-1).clamp_min(1)
-        causal_loc = cum_data / denominator
+        # 数值稳定：NPU 不支持 float64，scaler 被迫走 float32。原始 Welford 在线方差在
+        # float32 下对「大均值、小方差、长序列」数据会发生灾难性消减——data - prev_loc
+        # 是两个量级相近的大数相减（数据均值可达 ~1e6，float32 的 ULP≈0.06），真实波动
+        # 被抹平甚至让 m_2 累积出负值/NaN，最终 (data - loc)/scale 出现非有限值。
+        # 解法：先把每个序列平移到 0 附近（减去全局有效均值 ref）。标准差对平移不变，
+        # 所以 scale 不受影响；loc 最后加回 ref。平移后数据量级从 ~1e6 降到 ~std，
+        # 消除了大数相减的精度丢失。
+        valid_count = mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        ref = (data * mask).sum(dim=-1, keepdim=True) / valid_count
+        data_shifted = (data - ref) * mask
 
-        # Welford-style causal variance
-        prev_loc = torch.cat([torch.zeros_like(causal_loc[..., :1]), causal_loc[..., :-1]], dim=-1)
-        delta = data - prev_loc
-        increment = delta * (data - causal_loc) * mask
+        # Causal (cumulative) mean on the shifted data
+        cum_shifted = data_shifted.cumsum(dim=-1)
+        denominator = mask.cumsum(dim=-1).clamp_min(1)
+        causal_loc_shifted = cum_shifted / denominator
+
+        # Welford-style causal variance on the shifted data
+        prev_loc = torch.cat([torch.zeros_like(causal_loc_shifted[..., :1]), causal_loc_shifted[..., :-1]], dim=-1)
+        delta = data_shifted - prev_loc
+        increment = delta * (data_shifted - causal_loc_shifted) * mask
         m_2 = torch.cumsum(increment, dim=-1)
         causal_var = m_2 / (denominator - self.correction).clamp(min=1)
-        # Welford 的 M2 理论上非负，但 float32 长序列累积的舍入误差可能使其成为微小负值；
+        # Welford 的 M2 理论上非负，但 float32 长序列累积的舍入误差仍可能使其成为微小负值；
         # 直接 sqrt(负数) 会得 NaN，且后续 clamp(min=minimum_scale) 无法修复 NaN。
-        # 因此先把方差钳到 >= 0 再开方（负方差仅是数值误差，钳 0 不改变语义）。
         causal_var = causal_var.clamp(min=0.0)
         causal_scale = torch.sqrt(causal_var).clamp(min=self.minimum_scale)
+
+        # 还原 loc 到原坐标系（scale 对平移不变，无需还原）
+        causal_loc = causal_loc_shifted + ref
 
         # Patch-aware: use last value in each patch, repeat across patch
         loc = repeat(
