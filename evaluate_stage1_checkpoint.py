@@ -96,28 +96,29 @@ def prepare_input(entry, device, max_context, patch_size):
     """
     target = np.asarray(entry["target"], dtype=np.float32)
     if target.ndim == 1:
-        target = target.reshape(1, -1)
-    elif target.ndim == 2 and target.shape[0] == 1:
-        pass  # already [1, len]
+        target = target.reshape(1, 1, -1)          # [1, n_var=1, len]
+    elif target.ndim == 2:
+        target = target[None, ...]                  # [1, n_var, len]
     else:
         # Should not happen: multi-variate datasets are evaluated univariately.
         return None, False
 
+    n_var = target.shape[1]
     if target.shape[-1] < 2:
         return None, False
 
     if max_context and target.shape[-1] > max_context:
-        target = target[:, -max_context:]
+        target = target[:, :, -max_context:]
 
     original_valid = np.isfinite(target)
     length = target.shape[-1]
     pad_len = (-length) % patch_size
     if pad_len:
         target = np.concatenate(
-            [target, np.zeros((target.shape[0], pad_len), dtype=np.float32)], axis=-1
+            [target, np.zeros(target.shape[:-1] + (pad_len,), dtype=np.float32)], axis=-1
         )
         valid = np.concatenate(
-            [original_valid, np.zeros((target.shape[0], pad_len), dtype=bool)], axis=-1
+            [original_valid, np.zeros(target.shape[:-1] + (pad_len,), dtype=bool)], axis=-1
         )
     else:
         valid = original_valid
@@ -129,7 +130,7 @@ def prepare_input(entry, device, max_context, patch_size):
     inputs = {
         "target": torch.from_numpy(target).to(device),
         "target_mask": torch.from_numpy(valid).to(device),
-        "series_ids": torch.zeros((1, 1), dtype=torch.long, device=device),
+        "series_ids": torch.zeros((1, n_var), dtype=torch.long, device=device),
     }
     return inputs, True
 
