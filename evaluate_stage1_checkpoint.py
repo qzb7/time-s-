@@ -83,11 +83,16 @@ def metric_value(result, name):
     return float(v.iloc[0]) if hasattr(v, "iloc") else float(v[0])
 
 
-def prepare_input(entry, device, max_context):
+def prepare_input(entry, device, max_context, patch_size):
     """Convert one univariate GIFT-Eval test window into Toto2Model.forecast inputs.
 
     Returns ``(inputs, ok)``. ``ok=False`` means the window was skipped (e.g. an
     empty / all-NaN series).
+
+    ``Toto2Model.forecast`` requires the context length to be a multiple of
+    ``patch_size`` (the official GluonTS ``instance_splitter`` floors
+    ``past_length`` to a patch multiple; we instead pad the tail so no history
+    is dropped).  Padding positions are masked out via ``target_mask=False``.
     """
     target = np.asarray(entry["target"], dtype=np.float32)
     if target.ndim == 1:
@@ -104,7 +109,19 @@ def prepare_input(entry, device, max_context):
     if max_context and target.shape[-1] > max_context:
         target = target[:, -max_context:]
 
-    valid = np.isfinite(target)
+    original_valid = np.isfinite(target)
+    length = target.shape[-1]
+    pad_len = (-length) % patch_size
+    if pad_len:
+        target = np.concatenate(
+            [target, np.zeros((target.shape[0], pad_len), dtype=np.float32)], axis=-1
+        )
+        valid = np.concatenate(
+            [original_valid, np.zeros((target.shape[0], pad_len), dtype=bool)], axis=-1
+        )
+    else:
+        valid = original_valid
+
     if not valid.any():
         return None, False
 
@@ -217,8 +234,9 @@ def main():
             pairs = pairs[: args.max_samples]
 
         eval_inputs, eval_labels, forecasts = [], [], []
+        patch_size = model.config.patch_size
         for inp, lab in pairs:
-            inputs, ok = prepare_input(inp, device, args.max_context)
+            inputs, ok = prepare_input(inp, device, args.max_context, patch_size)
             if not ok:
                 continue
             with torch.no_grad():
