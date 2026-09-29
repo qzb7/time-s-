@@ -83,56 +83,55 @@ def metric_value(result, name):
     return float(v.iloc[0]) if hasattr(v, "iloc") else float(v[0])
 
 
-def prepare_input(entry, device, max_context, patch_size):
-    """Convert one univariate GIFT-Eval test window into Toto2Model.forecast inputs.
+def prepare_batch(windows, device, max_context, patch_size):
+    """Collate several univariate GIFT-Eval windows into one batched ``forecast`` call.
 
-    Returns ``(inputs, ok)``. ``ok=False`` means the window was skipped (e.g. an
-    empty / all-NaN series).
-
-    ``Toto2Model.forecast`` requires the context length to be a multiple of
-    ``patch_size`` (the official GluonTS ``instance_splitter`` floors
-    ``past_length`` to a patch multiple; we instead pad the tail so no history
-    is dropped).  Padding positions are masked out via ``target_mask=False``.
+    ``windows`` is a list of ``(input_entry, label_entry)``.  Contexts of
+    differing length are right-padded (with ``target_mask=False``) to a common
+    length that is a multiple of ``patch_size``, which ``Toto2Model.forecast``
+    requires.  Returns ``(inputs, metas)`` where ``metas`` is the aligned list of
+    ``(input_entry, label_entry)`` for each kept row, or ``(None, [])`` when the
+    chunk contains no usable window.
     """
-    target = np.asarray(entry["target"], dtype=np.float32)
-    if target.ndim == 1:
-        target = target.reshape(1, 1, -1)          # [1, n_var=1, len]
-    elif target.ndim == 2:
-        target = target[None, ...]                  # [1, n_var, len]
-    else:
-        # Should not happen: multi-variate datasets are evaluated univariately.
-        return None, False
+    rows = []  # (target_1d, valid_1d, input_entry, label_entry)
+    for inp, lab in windows:
+        t = np.asarray(inp["target"], dtype=np.float32)
+        if t.ndim == 1:
+            pass
+        elif t.ndim == 2 and t.shape[0] == 1:
+            t = t[0]
+        else:
+            continue  # multi-variate not expected after to_univariate
+        if t.shape[0] < 2:
+            continue
+        if max_context and t.shape[0] > max_context:
+            t = t[-max_context:]
+        valid = np.isfinite(t)
+        if not valid.any():
+            continue
+        rows.append((t, valid, inp, lab))
 
-    n_var = target.shape[1]
-    if target.shape[-1] < 2:
-        return None, False
+    if not rows:
+        return None, []
 
-    if max_context and target.shape[-1] > max_context:
-        target = target[:, :, -max_context:]
+    max_len = max(r[0].shape[0] for r in rows)
+    unified_len = ((max_len + patch_size - 1) // patch_size) * patch_size
 
-    original_valid = np.isfinite(target)
-    length = target.shape[-1]
-    pad_len = (-length) % patch_size
-    if pad_len:
-        target = np.concatenate(
-            [target, np.zeros(target.shape[:-1] + (pad_len,), dtype=np.float32)], axis=-1
-        )
-        valid = np.concatenate(
-            [original_valid, np.zeros(target.shape[:-1] + (pad_len,), dtype=bool)], axis=-1
-        )
-    else:
-        valid = original_valid
+    batch = len(rows)
+    target = np.zeros((batch, 1, unified_len), dtype=np.float32)
+    mask = np.zeros((batch, 1, unified_len), dtype=bool)
+    for b, (t, valid, _, _) in enumerate(rows):
+        n = t.shape[0]
+        target[b, 0, :n] = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        mask[b, 0, :n] = valid
 
-    if not valid.any():
-        return None, False
-
-    target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     inputs = {
         "target": torch.from_numpy(target).to(device),
-        "target_mask": torch.from_numpy(valid).to(device),
-        "series_ids": torch.zeros((1, n_var), dtype=torch.long, device=device),
+        "target_mask": torch.from_numpy(mask).to(device),
+        "series_ids": torch.zeros((batch, 1), dtype=torch.long, device=device),
     }
-    return inputs, True
+    metas = [(r[2], r[3]) for r in rows]
+    return inputs, metas
 
 
 def build_configs(args, short_datasets, med_long_datasets):
@@ -173,6 +172,7 @@ def main():
     parser.add_argument("--max_context", type=int, default=8192, help="Truncate context to last N observations (default 8192, match training).")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit windows per dataset (for smoke tests).")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size passed to evaluate_model (metrics only).")
+    parser.add_argument("--infer_batch_size", type=int, default=64, help="Batch size for batched forecast inference (NPU/GPU throughput).")
     parser.add_argument("--shard_id", type=int, default=0, help="Shard index for parallel eval.")
     parser.add_argument("--num_shards", type=int, default=1, help="Total shards for parallel eval.")
     parser.add_argument("--model_name", default=None, help="Label in the CSV (default: checkpoint dir name).")
@@ -236,9 +236,11 @@ def main():
 
         eval_inputs, eval_labels, forecasts = [], [], []
         patch_size = model.config.patch_size
-        for inp, lab in pairs:
-            inputs, ok = prepare_input(inp, device, args.max_context, patch_size)
-            if not ok:
+        infer_bs = max(1, args.infer_batch_size)
+        for start in range(0, len(pairs), infer_bs):
+            chunk = pairs[start:start + infer_bs]
+            inputs, metas = prepare_batch(chunk, device, args.max_context, patch_size)
+            if inputs is None:
                 continue
             with torch.no_grad():
                 q = model.forecast(
@@ -248,16 +250,18 @@ def main():
                     scaler_fallback_min_obs=8,
                     quantile_real_cap_k=1e4,
                 )
-            # q: [n_quantiles, 1, 1, horizon] -> [n_quantiles, horizon]
-            q = q[:, 0, 0, :].cpu().numpy()
-            if not np.isfinite(q).all():
-                print(f"[skip-window] {name}/{term}: non-finite forecast for {lab.get('item_id')}", flush=True)
-                continue
-            forecasts.append(
-                QuantileForecast(q, lab["start"], QUANTILE_KEYS, item_id=lab.get("item_id"))
-            )
-            eval_inputs.append(inp)
-            eval_labels.append(lab)
+            # q: [n_quantiles, batch, 1, horizon] -> per-window [n_quantiles, horizon]
+            q = q.cpu().numpy()
+            for b, (inp, lab) in enumerate(metas):
+                qb = q[:, b, 0, :]
+                if not np.isfinite(qb).all():
+                    print(f"[skip-window] {name}/{term}: non-finite forecast for {lab.get('item_id')}", flush=True)
+                    continue
+                forecasts.append(
+                    QuantileForecast(qb, lab["start"], QUANTILE_KEYS, item_id=lab.get("item_id"))
+                )
+                eval_inputs.append(inp)
+                eval_labels.append(lab)
 
         if not forecasts:
             print(f"[skip] {name}/{term}: no valid windows", flush=True)
