@@ -270,6 +270,10 @@ def main():
                 if lab_t.size:
                     lab_min = min(lab_min, float(lab_t.min()))
                     lab_max = max(lab_max, float(lab_t.max()))
+                if not eval_labels:  # 第一个有效窗口：打印 median 预测 vs 真实，便于定位偏移/缩放
+                    print(f"[first-window] {name}/{term} item={lab.get('item_id')}", flush=True)
+                    print(f"  median_pred = {np.round(qb[4], 3).tolist()}", flush=True)
+                    print(f"  label       = {np.round(lab_t, 3).tolist()}", flush=True)
                 forecasts.append(
                     QuantileForecast(qb, lab["start"], QUANTILE_KEYS, item_id=lab.get("item_id"))
                 )
