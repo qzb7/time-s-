@@ -246,10 +246,6 @@ def main():
         print(f"[loaded] {name}/{term}: {len(pairs)} windows", flush=True)
 
         eval_inputs, eval_labels, forecasts = [], [], []
-        pred_min, pred_max = float("inf"), float("-inf")
-        lab_min, lab_max = float("inf"), float("-inf")
-        neg_median_windows = 0
-        worst_windows = []  # (median_mae, item_id, ctx_tail, med, lab)
         patch_size = model.config.patch_size
         infer_bs = max(1, args.infer_batch_size)
         for start in range(0, len(pairs), infer_bs):
@@ -272,38 +268,11 @@ def main():
                 if not np.isfinite(qb).all():
                     print(f"[skip-window] {name}/{term}: non-finite forecast for {lab.get('item_id')}", flush=True)
                     continue
-                pred_min = min(pred_min, float(qb.min()))
-                pred_max = max(pred_max, float(qb.max()))
-                lab_t = np.asarray(lab["target"], dtype=np.float32).reshape(-1)
-                if lab_t.size:
-                    lab_min = min(lab_min, float(lab_t.min()))
-                    lab_max = max(lab_max, float(lab_t.max()))
-                med = qb[4]
-                if (med < 0).any():
-                    neg_median_windows += 1
-                lab_valid = np.isfinite(lab_t)
-                if lab_valid.any():
-                    med_mae = float(np.mean(np.abs(med[lab_valid] - lab_t[lab_valid])))
-                    ctx_tail = inputs["target"][b, 0, -6:].cpu().numpy()
-                    worst_windows.append((med_mae, lab.get("item_id"), np.round(ctx_tail, 1).tolist(), np.round(med, 1).tolist(), np.round(lab_t, 1).tolist()))
-                    worst_windows.sort(key=lambda x: x[0], reverse=True)
-                    del worst_windows[3:]
-                if not eval_labels:  # 第一个有效窗口：打印 median 预测 vs 真实，便于定位偏移/缩放
-                    ctx = inputs["target"][b, 0].cpu().numpy()
-                    ctxm = inputs["target_mask"][b, 0].cpu().numpy()
-                    print(f"[first-window] {name}/{term} item={lab.get('item_id')}", flush=True)
-                    print(f"  ctx_len={ctx.shape[0]} n_valid={int(ctxm.sum())} tail={np.round(ctx[-6:], 1).tolist()} tail_mask={ctxm[-6:].tolist()}", flush=True)
-                    print(f"  median_pred = {np.round(qb[4], 3).tolist()}", flush=True)
-                    print(f"  label       = {np.round(lab_t, 3).tolist()}", flush=True)
                 forecasts.append(
                     QuantileForecast(qb, lab["start"], QUANTILE_KEYS, item_id=lab.get("item_id"))
                 )
                 eval_inputs.append(inp)
                 eval_labels.append(lab)
-
-        print(f"[worst] {name}/{term}: neg_median={neg_median_windows}/{len(forecasts)}", flush=True)
-        for med_mae, item_id, ctx_tail, med, lab in worst_windows:
-            print(f"  mae={med_mae:.1f} item={item_id} ctx_tail={ctx_tail} med={med} lab={lab}", flush=True)
 
         if not forecasts:
             print(f"[skip] {name}/{term}: no valid windows", flush=True)
@@ -341,7 +310,7 @@ def main():
             metric_value(result, "mean_weighted_sum_quantile_loss"),
             "Unknown", meta.target_dim, term,
         ]
-        print(f"[ok] {name}/{term}: {len(forecasts)} windows, MASE={row[5]:.4f}, CRPS={row[13]:.4f} | pred=[{pred_min:.3g},{pred_max:.3g}] label=[{lab_min:.3g},{lab_max:.3g}]", flush=True)
+        print(f"[ok] {name}/{term}: {len(forecasts)} windows, MAE={row[5]:.4f}, MASE={row[6]:.4f}, CRPS={row[13]:.4f}", flush=True)
         with csv_path.open("a", newline="") as f:
             csv.writer(f).writerow(row)
 
