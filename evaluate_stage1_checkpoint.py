@@ -230,11 +230,18 @@ def main():
             continue
 
         horizon = int(ds.prediction_length)
-        pairs = list(zip(ds.test_data.input, ds.test_data.label))
+        print(f"[loading] {name}/{term}: generating test windows (horizon={horizon}) ...", flush=True)
+        # ``test_data`` is a plain @property that re-runs ``split`` + ``generate_instances``
+        # on every access; cache it once to avoid paying that cost twice below.
+        test_data = ds.test_data
+        pairs = list(zip(test_data.input, test_data.label))
         if args.max_samples is not None:
             pairs = pairs[: args.max_samples]
+        print(f"[loaded] {name}/{term}: {len(pairs)} windows", flush=True)
 
         eval_inputs, eval_labels, forecasts = [], [], []
+        pred_min, pred_max = float("inf"), float("-inf")
+        lab_min, lab_max = float("inf"), float("-inf")
         patch_size = model.config.patch_size
         infer_bs = max(1, args.infer_batch_size)
         for start in range(0, len(pairs), infer_bs):
@@ -257,6 +264,12 @@ def main():
                 if not np.isfinite(qb).all():
                     print(f"[skip-window] {name}/{term}: non-finite forecast for {lab.get('item_id')}", flush=True)
                     continue
+                pred_min = min(pred_min, float(qb.min()))
+                pred_max = max(pred_max, float(qb.max()))
+                lab_t = np.asarray(lab["target"], dtype=np.float32).reshape(-1)
+                if lab_t.size:
+                    lab_min = min(lab_min, float(lab_t.min()))
+                    lab_max = max(lab_max, float(lab_t.max()))
                 forecasts.append(
                     QuantileForecast(qb, lab["start"], QUANTILE_KEYS, item_id=lab.get("item_id"))
                 )
@@ -299,7 +312,7 @@ def main():
             metric_value(result, "mean_weighted_sum_quantile_loss"),
             "Unknown", meta.target_dim, term,
         ]
-        print(f"[ok] {name}/{term}: {len(forecasts)} windows, MASE={row[5]:.4f}, CRPS={row[13]:.4f}", flush=True)
+        print(f"[ok] {name}/{term}: {len(forecasts)} windows, MASE={row[5]:.4f}, CRPS={row[13]:.4f} | pred=[{pred_min:.3g},{pred_max:.3g}] label=[{lab_min:.3g},{lab_max:.3g}]", flush=True)
         with csv_path.open("a", newline="") as f:
             csv.writer(f).writerow(row)
 
