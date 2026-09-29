@@ -86,10 +86,14 @@ def metric_value(result, name):
 def prepare_batch(windows, device, max_context, patch_size):
     """Collate several univariate GIFT-Eval windows into one batched ``forecast`` call.
 
-    ``windows`` is a list of ``(input_entry, label_entry)``.  Contexts of
-    differing length are right-padded (with ``target_mask=False``) to a common
-    length that is a multiple of ``patch_size``, which ``Toto2Model.forecast``
-    requires.  Returns ``(inputs, metas)`` where ``metas`` is the aligned list of
+    Training samples Toto-2 sequences as fixed ``max_sequence_length`` windows
+    that are LEFT-padded (data right-aligned, padding/missing marked with
+    ``target_mask=0``).  We must reproduce that exact layout here: truncate long
+    histories to the last ``max_context`` points and left-pad short histories to
+    ``max_context`` so every context is a fixed-length, patch-aligned sequence.
+
+    ``windows`` is a list of ``(input_entry, label_entry)``.  Returns
+    ``(inputs, metas)`` where ``metas`` is the aligned list of
     ``(input_entry, label_entry)`` for each kept row, or ``(None, [])`` when the
     chunk contains no usable window.
     """
@@ -114,16 +118,18 @@ def prepare_batch(windows, device, max_context, patch_size):
     if not rows:
         return None, []
 
-    max_len = max(r[0].shape[0] for r in rows)
-    unified_len = ((max_len + patch_size - 1) // patch_size) * patch_size
+    ctx_len = max_context or max(r[0].shape[0] for r in rows)
+    if ctx_len % patch_size:
+        ctx_len = ((ctx_len + patch_size - 1) // patch_size) * patch_size
 
     batch = len(rows)
-    target = np.zeros((batch, 1, unified_len), dtype=np.float32)
-    mask = np.zeros((batch, 1, unified_len), dtype=bool)
+    target = np.zeros((batch, 1, ctx_len), dtype=np.float32)
+    mask = np.zeros((batch, 1, ctx_len), dtype=bool)
     for b, (t, valid, _, _) in enumerate(rows):
         n = t.shape[0]
-        target[b, 0, :n] = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-        mask[b, 0, :n] = valid
+        start = ctx_len - n  # right-align: data at the end, left-padding at front
+        target[b, 0, start:] = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        mask[b, 0, start:] = valid
 
     inputs = {
         "target": torch.from_numpy(target).to(device),
@@ -169,7 +175,7 @@ def main():
     parser.add_argument("--device", default=None, help="Device (auto-detects npu/cuda/cpu if omitted).")
     parser.add_argument("--datasets", nargs="*", default=None, help="Space/comma separated dataset names (name or name:term). Default: derived from --terms.")
     parser.add_argument("--terms", nargs="*", default=["short"], help="Terms to evaluate: short/medium/long (default: short).")
-    parser.add_argument("--max_context", type=int, default=8192, help="Truncate context to last N observations (default 8192, match training).")
+    parser.add_argument("--max_context", type=int, default=8192, help="Fixed context length (left-padded to N, right-aligned). Must match training --max_sequence_length (default 8192).")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit windows per dataset (for smoke tests).")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size passed to evaluate_model (metrics only).")
     parser.add_argument("--infer_batch_size", type=int, default=64, help="Batch size for batched forecast inference (NPU/GPU throughput).")
@@ -271,7 +277,10 @@ def main():
                     lab_min = min(lab_min, float(lab_t.min()))
                     lab_max = max(lab_max, float(lab_t.max()))
                 if not eval_labels:  # 第一个有效窗口：打印 median 预测 vs 真实，便于定位偏移/缩放
+                    ctx = inputs["target"][b, 0].cpu().numpy()
+                    ctxm = inputs["target_mask"][b, 0].cpu().numpy()
                     print(f"[first-window] {name}/{term} item={lab.get('item_id')}", flush=True)
+                    print(f"  ctx_len={ctx.shape[0]} n_valid={int(ctxm.sum())} tail={np.round(ctx[-6:], 1).tolist()} tail_mask={ctxm[-6:].tolist()}", flush=True)
                     print(f"  median_pred = {np.round(qb[4], 3).tolist()}", flush=True)
                     print(f"  label       = {np.round(lab_t, 3).tolist()}", flush=True)
                 forecasts.append(
