@@ -39,8 +39,8 @@ p = argparse.ArgumentParser()
 p.add_argument("shards", type=Path)
 p.add_argument("output", type=Path)
 p.add_argument("--expected", type=int, required=True)
-p.add_argument("--workers", type=int, default=0,
-               help="并行 merge 的进程数（0 = 自动：按 CPU 核数，上限为 block 数）")
+p.add_argument("--workers", type=int, default=10,
+               help="并行 merge 的进程数（默认 8；0 = 自动按 CPU 核数，上限为 block 数）")
 a = p.parse_args()
 markers = sorted(a.shards.glob("DONE-rank-*.json"))
 if not markers:
