@@ -57,9 +57,11 @@ def arrow_freqs_and_rows(path: Path) -> tuple[list[str], int]:
         info_data = json.loads(info.read_text(encoding="utf-8"))
         rows = sum(int(split.get("num_examples", 0))
                    for split in info_data.get("splits", {}).values())
-    # freq 在同一数据集内固定，只读每个 arrow 文件的第一个 batch 即可。
-    for arrow in sorted(path.glob("*.arrow")):
-        source = pa.memory_map(str(arrow), "r")
+    # freq 在同一数据集内固定，只读第一个 arrow 文件即可。用 OSFile 而非 memory_map：
+    # obsfs 对 mmap 支持弱，mmap 大文件会触发整文件拉取（表现为持续几百 MB/s 下载）。
+    arrows = sorted(path.glob("*.arrow"))
+    if arrows:
+        source = pa.OSFile(str(arrows[0]), "rb")
         try:
             try:
                 reader = pa.ipc.open_stream(source)
