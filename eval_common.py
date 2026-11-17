@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -187,6 +188,18 @@ def cache_manifest(args, task):
     return path
 
 
+_TIMING = dict(inference_seconds=0.0, batch_latencies=[], total_samples=0)
+
+
+def _synchronize(device: str) -> None:
+    t = torch.device(device)
+    if t.type == 'npu':
+        import torch_npu
+        torch_npu.npu.synchronize()
+    elif t.type == 'cuda':
+        torch.cuda.synchronize()
+
+
 def resolve_device(local: int = 0) -> str:
     try:
         import torch_npu
@@ -312,8 +325,14 @@ class Predictor:
             if self.args.mode == 'endogenous':
                 im = torch.from_numpy(np.ascontiguousarray(image)).to(self.device).unsqueeze(1)
                 tx = torch.from_numpy(np.ascontiguousarray(text)).to(self.device).unsqueeze(1)
+                t0 = time.perf_counter()
                 q = self.model.forecast_parallel(target, valid, im, tx, self.task['horizon'],
                                                 has_missing_values=True, scaler_fallback_min_obs=8)
+                _synchronize(self.device)
+                dt = time.perf_counter() - t0
+                _TIMING['inference_seconds'] += dt
+                _TIMING['batch_latencies'].append(dt)
+                _TIMING['total_samples'] += len(entries)
             else:
                 inputs = dict(target=target, target_mask=valid,
                               series_ids=torch.zeros(target.shape[:-1], dtype=torch.long, device=self.device))
@@ -391,11 +410,35 @@ def finalize(args, tasks, signature):
     return not missing
 
 
+def _write_inference_report(args, mode, device, wall_seconds, rank, world):
+    latencies = _TIMING['batch_latencies']
+    total_batches = len(latencies)
+    inference_seconds = _TIMING['inference_seconds']
+    total_samples = _TIMING['total_samples']
+    steady = latencies[1:] if len(latencies) > 1 else []
+    report = dict(
+        benchmark='gifteval', mode=mode, model=args.model_name, device=device,
+        backend=torch.device(device).type, batch_size=args.batch_size,
+        rank=rank, world=world, total_batches=total_batches, total_samples=total_samples,
+        inference_seconds=round(inference_seconds, 3), wall_seconds=round(wall_seconds, 3),
+        avg_latency_ms_per_batch=round(inference_seconds / total_batches * 1000, 2) if total_batches else None,
+        avg_latency_ms_per_batch_excl_warmup=round(sum(steady) / len(steady) * 1000, 2) if steady else None,
+        avg_latency_ms_per_sample=round(inference_seconds / total_samples * 1000, 4) if total_samples else None,
+        throughput_samples_per_sec=round(total_samples / inference_seconds, 2) if inference_seconds else None,
+        first_batch_ms=round(latencies[0] * 1000, 2) if latencies else None,
+        note='inference = model.forecast_parallel forward only (image/text from pre-generated cache); first batch includes NPU/CUDA graph compile',
+    )
+    name = 'inference_speed.json' if world == 1 else f'inference_speed.rank-{rank}.json'
+    atomic_json(args.output / name, report)
+
+
 def main(mode):
     args = arguments(mode)
     rank, world, local = (int(os.getenv(k, d)) for k, d in [('RANK', '0'), ('WORLD_SIZE', '1'), ('LOCAL_RANK', '0')])
     if not 0 <= rank < world:
         raise ValueError('Invalid rank/world size')
+    t_start = time.perf_counter()
+    _TIMING.update(inference_seconds=0.0, batch_latencies=[], total_samples=0)
     tasks = plan(args)
     print(json.dumps(dict(event='plan', configs=len(tasks), samples=sum(x['evaluate_samples'] for x in tasks),
                           rank=rank, world=world, preview=bool(args.max_samples))), flush=True)
@@ -445,4 +488,5 @@ def main(mode):
     if world == 1:
         if not finalize(args, tasks, sig):
             raise RuntimeError('Incomplete run')
+    _write_inference_report(args, mode, device, time.perf_counter() - t_start, rank, world)
     print(json.dumps(dict(event='rank_complete', rank=rank)), flush=True)
