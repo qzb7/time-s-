@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import random
 import sys
+import time
 
 
 def parse_bool(value):
@@ -40,6 +41,8 @@ def parse_args():
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--logging-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--prefetch-factor", type=int, default=4,
+                   help="DataLoader prefetch depth; only applies when --num-workers > 0")
     p.add_argument("--seed", type=int, default=260817)
     p.add_argument("--bf16", type=parse_bool, default=False)
     p.add_argument("--tf32", type=parse_bool, default=False)
@@ -240,7 +243,8 @@ def main():
     model.train()
     iterator = iter(DataLoader(dataset, batch_size=args.batch_size,
                     num_workers=args.num_workers, pin_memory=device.type == "cuda",
-                    drop_last=True, persistent_workers=args.num_workers > 0))
+                    drop_last=True, persistent_workers=args.num_workers > 0,
+                    prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None))
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
         (output / "training_args.json").write_text(json.dumps(vars(args), indent=2) + "\n")
@@ -292,7 +296,11 @@ def main():
 
     log_stage("start", start)
     optimizer.zero_grad(set_to_none=True)
+    step_seconds_list = []
+    data_seconds_total = 0.0
+    total_samples = 0
     for step in range(start, args.stop_after_steps):
+        step_start = time.perf_counter()
         if head_only and step >= args.head_steps:
             if world > 1:
                 dist.barrier()
@@ -304,7 +312,10 @@ def main():
             log_stage("unfreeze_last8", step + 1)
         stats = []
         for micro in range(args.gradient_accumulation_steps):
+            t_load = time.perf_counter()
             batch = next(iterator)
+            data_seconds_total += time.perf_counter() - t_load
+            total_samples += args.batch_size * world
             prepared = prepare_tail_first_batch(batch, device, patch_size=32,
                 max_span_patches=args.cpm_max_span_patches,
                 max_mask_probability=args.cpm_max_mask_probability)
@@ -330,6 +341,7 @@ def main():
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        step_seconds_list.append(time.perf_counter() - step_start)
         if rank == 0 and (step + 1) % args.logging_steps == 0:
             a, b, c, count = torch.stack(stats).mean(0).tolist()
             print(json.dumps({"step": step + 1, "stage": 1 if head_only else 2,
@@ -338,6 +350,22 @@ def main():
                 "learning_rate": optimizer.param_groups[0]["lr"]}), flush=True)
         if (step + 1) % args.save_steps == 0 or step + 1 == args.stop_after_steps:
             save(step + 1)
+    steady = step_seconds_list[1:] if len(step_seconds_list) > 1 else []
+    report = dict(
+        benchmark='endogenous_training', device=str(device), backend=device.type,
+        world_size=world, batch_size=args.batch_size,
+        grad_accum_steps=args.gradient_accumulation_steps,
+        total_steps=len(step_seconds_list), total_samples=total_samples,
+        avg_step_seconds=round(sum(step_seconds_list)/len(step_seconds_list), 3) if step_seconds_list else None,
+        avg_step_seconds_excl_first=round(sum(steady)/len(steady), 3) if steady else None,
+        throughput_samples_per_sec=round(total_samples/sum(step_seconds_list), 2) if step_seconds_list and sum(step_seconds_list) > 0 else None,
+        total_data_seconds=round(data_seconds_total, 3),
+        first_step_seconds=round(step_seconds_list[0], 3) if step_seconds_list else None,
+        note='step = forward+backward+optimizer+dataloader (save excluded); data_seconds = next(iterator) only; first step includes NPU graph compile',
+    )
+    name = 'training_speed.json' if world == 1 else f'training_speed.rank-{rank}.json'
+    output.mkdir(parents=True, exist_ok=True)
+    (output / name).write_text(json.dumps(report, indent=2))
     if world > 1:
         dist.destroy_process_group()
 
