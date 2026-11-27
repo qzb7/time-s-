@@ -19,7 +19,9 @@ def arguments():
     p.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
     p.add_argument('--cache-dir', type=Path, required=True)
     p.add_argument('--checkpoint', type=Path, required=True)
-    p.add_argument('--shared-head', type=Path, help='Optional shared_head_state.pt from joint checkpoint-1000')
+    p.add_argument('--shared-head', type=Path, help='Optional shared_head_state.pt from joint checkpoint-1000 (ignored with --unimodal)')
+    p.add_argument('--unimodal', action='store_true', help='Load a pure-numerical (Toto2 architecture) checkpoint; skip image/text entirely')
+    p.add_argument('--toto2-src', type=Path, default=None, help='Path to the stage1/toto2 package (auto-resolved if omitted)')
     p.add_argument('--output-dir', type=Path, required=True, help='ONE model directory, not results root')
     p.add_argument('--model-name', default='QiYao-M')
     p.add_argument('--batch-size', type=int, default=32)
@@ -36,13 +38,16 @@ def arguments():
 
 
 def weights(a):
-    paths = [a.checkpoint / n for n in ['config.json', 'layer16_concat_additive_state.pt']]
+    if a.unimodal:
+        paths = [a.checkpoint / 'config.json']
+    else:
+        paths = [a.checkpoint / n for n in ['config.json', 'layer16_concat_additive_state.pt']]
     index = a.checkpoint / 'model.safetensors.index.json'
     if index.is_file():
         paths += [index] + [a.checkpoint / n for n in sorted(set(json.loads(index.read_text())['weight_map'].values()))]
     else:
         paths += [a.checkpoint / 'model.safetensors']
-    if a.shared_head:
+    if not a.unimodal and a.shared_head:
         paths.append(a.shared_head)
     # Fail closed: the native loader would otherwise initialize random fusion weights.
     for path in paths:
@@ -53,17 +58,45 @@ def weights(a):
 
 def load_model(a, device):
     import torch
-    from qiyaom.modeling_qiyaom import EndoMultimodalPredictor
     if device.startswith('cuda'):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = True
-    model = EndoMultimodalPredictor.from_pretrained(a.checkpoint, map_location='cpu')
-    if a.shared_head:
-        head = torch.load(a.shared_head, map_location='cpu', weights_only=True)
-        model.base_model.output_head.load_state_dict(head, strict=True)
-        print('VERIFIED_SHARED_HEAD', len(head), flush=True)
-    if model.patch_size != 32:
-        raise ValueError('Expected patch-size 32')
+    if a.unimodal:
+        sys_paths = []
+        if a.toto2_src is not None:
+            sys_paths.append(str(Path(a.toto2_src)))
+        else:
+            # Walk up from this script looking for stage1/toto2.
+            here = ROOT
+            for _ in range(6):
+                cand = here / 'stage1' / 'toto2'
+                if cand.is_dir():
+                    sys_paths.append(str(cand))
+                    break
+                if (here / 'toto2').is_dir():
+                    sys_paths.append(str(here / 'toto2'))
+                    break
+                here = here.parent
+        for sp in sys_paths:
+            if sp not in sys.path:
+                sys.path.insert(0, sp)
+        from toto2 import Toto2Model
+        model = Toto2Model.from_pretrained(a.checkpoint, map_location='cpu')
+        if model.config.patch_size != 32:
+            raise ValueError(f'Expected patch-size 32, got {model.config.patch_size}')
+        n_var = 1  # TIME benchmark is always univariate
+        model_type = f'Toto2 (patch={model.config.patch_size}, d_model={model.config.d_model})'
+    else:
+        from qiyaom.modeling_qiyaom import EndoMultimodalPredictor
+        model = EndoMultimodalPredictor.from_pretrained(a.checkpoint, map_location='cpu')
+        if a.shared_head:
+            head = torch.load(a.shared_head, map_location='cpu', weights_only=True)
+            model.base_model.output_head.load_state_dict(head, strict=True)
+            print('VERIFIED_SHARED_HEAD', len(head), flush=True)
+        if model.patch_size != 32:
+            raise ValueError('Expected patch-size 32')
+        n_var = 1
+        model_type = f'EndoMultimodalPredictor (patch={model.patch_size})'
     # Same parameter-wise FP32 move as the old 207 evaluator.
     with torch.no_grad():
         for param in model.parameters():
@@ -71,6 +104,7 @@ def load_model(a, device):
             param.grad = None
         for buf in model.buffers():
             buf.data = buf.data.to(device=device, dtype=torch.float32 if buf.is_floating_point() else buf.dtype)
+    print(f'LOADED_MODEL {model_type} n_var={n_var} device={device}', flush=True)
     return model.eval()
 
 
@@ -118,7 +152,7 @@ def main():
                     cache=str(a.cache_dir.resolve()), cache_receipts=cache.receipts,
                     context_length=8192, patch_size=32, dtype='float32',
                     scaler_fallback_min_obs=a.scaler_fallback_min_obs, batch_size=a.batch_size,
-                    model_name=a.model_name, external_attention=False,
+                    model_name=a.model_name, external_attention=False, unimodal=a.unimodal,
                     code_sha256={f: digest(ROOT / f) for f in
                                  ['evaluate_time.py', 'time_common.py', 'qiyaom/modeling_qiyaom.py',
                                   'qiyaom/backbone_qiyaom.py', 'timebench/evaluation/data.py',
@@ -158,13 +192,22 @@ def main():
                     raise ValueError(f'{ds_config}: cached history does not match official input')
                 target = torch.from_numpy(batch['target']).to(device).unsqueeze(1)
                 mask = torch.from_numpy(batch['mask']).to(device).unsqueeze(1)
-                image = torch.from_numpy(batch['image']).to(device).unsqueeze(1)
-                text = torch.from_numpy(batch['text']).to(device).unsqueeze(1)
                 t0 = time.perf_counter()
                 with torch.inference_mode():
-                    q = model.forecast_parallel(target, mask, image, text, int(ds.prediction_length),
-                                                has_missing_values=True,
-                                                scaler_fallback_min_obs=a.scaler_fallback_min_obs)
+                    if a.unimodal:
+                        series_ids = torch.zeros(len(keys), 1, dtype=torch.long, device=device)
+                        q = model.forecast(
+                            dict(target=target, target_mask=mask, series_ids=series_ids),
+                            int(ds.prediction_length),
+                            has_missing_values=True,
+                            scaler_fallback_min_obs=a.scaler_fallback_min_obs,
+                        )
+                    else:
+                        image = torch.from_numpy(batch['image']).to(device).unsqueeze(1)
+                        text = torch.from_numpy(batch['text']).to(device).unsqueeze(1)
+                        q = model.forecast_parallel(target, mask, image, text, int(ds.prediction_length),
+                                                    has_missing_values=True,
+                                                    scaler_fallback_min_obs=a.scaler_fallback_min_obs)
                 _sync(device)
                 dt = time.perf_counter() - t0
                 inference_seconds += dt
@@ -188,7 +231,7 @@ def main():
                                     output_base_dir=str(work), seasonality=get_seasonality(ds.freq),
                                     model_hyperparams=dict(model_name=a.model_name, checkpoint=str(a.checkpoint),
                                                           shared_head=str(a.shared_head) if a.shared_head else None,
-                                                          dtype='float32', multimodal=True, external_attention=False),
+                                                          dtype='float32', multimodal=not a.unimodal, external_attention=False),
                                     quantile_levels=[i / 10 for i in range(1, 10)])
             write_json(work / ds_config / 'evaluation_complete.json', dict(signature=sig, task=task))
             os.rename(work / ds_config, destination)
@@ -206,7 +249,10 @@ def main():
         avg_latency_ms_per_sample=round(inference_seconds / total_samples * 1000, 4) if total_samples else None,
         throughput_samples_per_sec=round(total_samples / inference_seconds, 2) if inference_seconds else None,
         first_batch_ms=round(batch_latencies[0] * 1000, 2) if batch_latencies else None,
-        note='inference = model.forecast_parallel forward only (image/text from cache); first batch includes NPU/CUDA graph compile',
+        note=('inference = model.forecast_parallel forward only (image/text from cache)'
+              if not a.unimodal else
+              'inference = model.forecast forward only (pure numerical, no image/text); '
+              'first batch includes NPU/CUDA graph compile'),
     )
     name = 'inference_speed.json' if a.num_shards == 1 else f'inference_speed.shard-{a.shard_id}.json'
     write_json(a.output_dir / name, report)
