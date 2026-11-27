@@ -176,12 +176,26 @@ def _freq_to_seconds(freq):
     return 0.0
 
 
-def _build_inputs(target, device, interval_seconds):
-    """Official layout: (n_var, time) -> (1, n_var, time) with all-valid masks."""
+def _build_inputs(target, device, interval_seconds, patch_size):
+    """Official layout: (n_var, time) -> (1, n_var, time), padded to patch_size.
+
+    Toto-2 splits the context into patches, so the time axis must be a multiple
+    of ``patch_size``. The official Toto-1 notebook relies on the model to pad;
+    Stage1's Toto-2 requires the caller to hand over an aligned length. We pad on
+    the LEFT with NaN so the most recent observation stays adjacent to the
+    forecast region (right-aligned), and mark the padded positions as unobserved.
+    """
     import torch
+    target = np.asarray(target)
+    n_var, length = target.shape
+    pad = (-length) % patch_size
+    if pad:
+        target = np.concatenate(
+            [np.full((n_var, pad), np.nan, dtype=target.dtype), target], axis=-1)
     t = torch.as_tensor(target, dtype=torch.float32, device=device).unsqueeze(0)
-    n_var = t.shape[-2]
-    mask = torch.ones_like(t, dtype=torch.bool)
+    mask = torch.isfinite(t)
+    # The scaler must not see NaN; unobserved slots are excluded via the mask.
+    t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
     series_ids = torch.arange(n_var, device=device, dtype=torch.long).unsqueeze(0)
     return dict(target=t, target_mask=mask, series_ids=series_ids)
 
@@ -261,7 +275,7 @@ def main():
                 target = target[np.newaxis, :]
             target = target[..., -a.context_length:]
             target = clean_nan_target(target)
-            inputs = _build_inputs(target, device, interval)
+            inputs = _build_inputs(target, device, interval, model.config.patch_size)
             t0 = time.perf_counter()
             with torch.inference_mode():
                 q = model.forecast(
