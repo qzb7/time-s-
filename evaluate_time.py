@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import sys
 
 import numpy as np
 
@@ -56,30 +57,60 @@ def weights(a):
     return {str(p.resolve()): digest(p) for p in paths}
 
 
+def _resolve_toto2_sys_path(toto2_src_arg, script_root):
+    """Return the directory whose subdirectory ``toto2/`` is the package.
+
+    Accepts three user-supplied forms (all resolved to absolute paths):
+      1. project root containing ``toto2/__init__.py``
+      2. package directory itself (``.../toto2/`` containing ``__init__.py``)
+      3. None — auto-search script_root upward for ``stage1/toto2`` or ``toto2``
+
+    Raises FileNotFoundError with a concrete hint if nothing resolves.
+    """
+    candidates = []
+    if toto2_src_arg is not None:
+        arg = Path(toto2_src_arg).resolve()
+        candidates.append(arg)          # form 1: project root
+        candidates.append(arg.parent)   # form 2: package dir itself
+
+    for cand in candidates if candidates else []:
+        pkg_init = cand / 'toto2' / '__init__.py'
+        if pkg_init.is_file():
+            return str(cand), str(pkg_init)
+
+    # Auto-search fallback.
+    here = script_root.resolve()
+    for _ in range(8):
+        for cand in (here / 'stage1' / 'toto2', here / 'toto2'):
+            pkg_init = cand / '__init__.py'
+            if pkg_init.is_file():
+                # cand is the package dir; sys.path needs its parent.
+                return str(cand.parent), str(pkg_init)
+        here = here.parent
+        if not here or here == here.parent:
+            break
+
+    msg = [f'Cannot resolve Toto-2 package.']
+    if candidates:
+        shown = '  '.join(str(c) for c in candidates)
+        msg.append(f'--toto2-src={toto2_src_arg!r} resolved to candidates: {shown}')
+        msg.append('Expected form A: a directory that CONTAINS toto2/__init__.py (e.g. stage1/toto2/)')
+        msg.append('Expected form B: the package dir itself (e.g. stage1/toto2/toto2/) — code will use its parent')
+    else:
+        msg.append('No --toto2-src provided; auto-search walked upward from script root and found nothing.')
+    raise FileNotFoundError('\n'.join(msg))
+
+
 def load_model(a, device):
     import torch
     if device.startswith('cuda'):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = True
     if a.unimodal:
-        sys_paths = []
-        if a.toto2_src is not None:
-            sys_paths.append(str(Path(a.toto2_src)))
-        else:
-            # Walk up from this script looking for stage1/toto2.
-            here = ROOT
-            for _ in range(6):
-                cand = here / 'stage1' / 'toto2'
-                if cand.is_dir():
-                    sys_paths.append(str(cand))
-                    break
-                if (here / 'toto2').is_dir():
-                    sys_paths.append(str(here / 'toto2'))
-                    break
-                here = here.parent
-        for sp in sys_paths:
-            if sp not in sys.path:
-                sys.path.insert(0, sp)
+        sys_path, pkg_init = _resolve_toto2_sys_path(a.toto2_src, ROOT)
+        print(f'[unimodal] Adding to sys.path: {sys_path}  (found package at {pkg_init})', flush=True)
+        if sys_path not in sys.path:
+            sys.path.insert(0, sys_path)
         from toto2 import Toto2Model
         model = Toto2Model.from_pretrained(a.checkpoint, map_location='cpu')
         if model.config.patch_size != 32:
